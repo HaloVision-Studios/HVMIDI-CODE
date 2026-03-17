@@ -318,6 +318,138 @@ def bass_identification_node(tracks: list) -> int:
     return bass_idx
 
 
+def extract_voices(events):
+    """
+    Separates a flat list of note events into Melodic (Skyline), Bass, and Inner voices
+    based on their temporal overlap and pitch ranges.
+    """
+    # Group events by their quantized start times to find simultaneous chords/clusters
+    time_clusters = {}
+    for e in events:
+        t = round(e['time'] / 120) * 120  # Group by 16th note grid approx
+        if t not in time_clusters: time_clusters[t] = []
+        time_clusters[t].append(e)
+
+    melody_events = []
+    bass_events = []
+    inner_events = []
+
+    for t, cluster in time_clusters.items():
+        if not cluster: continue
+        cluster.sort(key=lambda x: x['pitch'])
+
+        # Bass Node: Lowest note
+        bass_events.append(cluster[0])
+
+        if len(cluster) > 1:
+            # Skyline Node: Highest note
+            melody_events.append(cluster[-1])
+
+            # Inner Voices: Everything in between
+            for inner in cluster[1:-1]:
+                inner_events.append(inner)
+
+    return bass_events, inner_events, melody_events
+
+
+def align_procedural_midi(raw_events: list,
+                          genre: str = "Lo-Fi",
+                          ppq: int = 480,
+                          iteration_depth: int = 0,
+                          global_key=None,
+                          show_step: bool = True):
+    profile = GENRE_PROFILES[genre]
+
+    # 1. Global Targets (Determined once and passed down)
+    if global_key is None:
+        pitch_durs = [(e['pitch'], e['duration']) for e in raw_events]
+        implied_key = infer_key_ks(pitch_durs)
+        log_step(f"Inferred Musical Key: Root {implied_key[0]}, Scale {implied_key[1]}", show_step)
+    else:
+        implied_key = global_key
+
+    # Define convergence phase
+    is_converging = iteration_depth > 1
+    if is_converging:
+        log_step("Convergence Phase: Locking voices and removing stochastic jitter.", show_step)
+        scale_strictness = 1.0
+        weirdness_ratio = 0.0
+        apply_humanization = False
+    else:
+        scale_strictness = profile["scale_strictness"]
+        weirdness_ratio = 1.0 - profile["scale_strictness"]
+        apply_humanization = True
+
+    # Buffers
+    aligned_events = []
+    aligned_events_per_stream = {"bass": [], "inner": [], "melody": []}
+
+    # 2. Extract stable voices for deterministic passing
+    bass_stream, inner_stream, melody_stream = extract_voices(raw_events)
+    all_streams = [("bass", bass_stream), ("inner", inner_stream), ("melody", melody_stream)]
+
+    for stream_name, stream in all_streams:
+        for i, event in enumerate(stream):
+            aligned = event.copy()
+            step_16th = ppq / 4.0
+            step_index = int(aligned['time'] / step_16th)
+
+            # Rhythmic Quantize
+            if profile["quantize_strictness"] > 0:
+                aligned['time'] = quantize_and_swing(aligned['time'], ppq, profile['swing_percent'])
+                if apply_humanization and genre == "Lo-Fi":
+                    aligned['time'] = apply_dilla_microtiming(
+                        aligned.get('instrument', 'hihat'),
+                        step_index / 4.0,
+                        aligned['time']
+                    )
+
+            # Pitch / Scale constraints
+            if np.random.random() < scale_strictness:
+                aligned['pitch'] = snap_to_scale(aligned['pitch'], implied_key[0], implied_key[1])
+
+            # Deterministic Voice Leading (Only in convergence phase)
+            if is_converging and aligned_events_per_stream[stream_name]:
+                prev_pitch = aligned_events_per_stream[stream_name][-1]['pitch']
+                if stream_name == 'melody':
+                    aligned['pitch'] = leap_resolution(prev_pitch, aligned['pitch'], aligned['pitch'])
+                elif stream_name == 'bass' and aligned['pitch'] > 60:
+                    aligned['pitch'] -= 12
+
+            # Dynamics
+            vel, dur = apply_velocity_and_articulation(step_index, aligned['duration'])
+            if not apply_humanization:
+                vel = VELOCITY_GRID[step_index % 16]
+
+            bar_idx = aligned['time'] / (ppq * 4)
+            tension_mod = sigmoid_tension_multiplier(bar_idx, total_bars=16)
+            aligned['velocity'] = int(np.clip(vel * tension_mod, 1, 127))
+            aligned['duration'] = dur
+
+            aligned_events.append(aligned)
+            aligned_events_per_stream[stream_name].append(aligned)
+
+    # Re-sort events chronologically after combining streams
+    aligned_events.sort(key=lambda x: x['time'])
+
+    # Low Interval Limit Check
+    for i in range(len(aligned_events) - 1):
+        if aligned_events[i]['pitch'] < 48:
+            pair = enforce_low_interval_limits([aligned_events[i]['pitch'],
+                                                aligned_events[i + 1]['pitch']])
+            aligned_events[i]['pitch'] = pair[0]
+
+    # 3. Weirdness Preservation (Only active in early passes)
+    if not is_converging and weirdness_ratio > 0:
+        final_events = protect_weirdness(raw_events, aligned_events,
+                                         protection_percentage=weirdness_ratio)
+    else:
+        final_events = aligned_events
+
+    return final_events, implied_key
+
+
+
 def apply_oblique_strategies(midi_sequence: list, strategy="random"):
     chosen = strategy if strategy in ["retrograde", "extreme_transposition"] else np.random.choice(
         ["retrograde", "extreme_transposition"])
@@ -328,80 +460,6 @@ def apply_oblique_strategies(midi_sequence: list, strategy="random"):
 def protect_weirdness(raw_events: list, aligned_events: list, protection_percentage: float = 0.10) -> list:
     return [raw if np.random.random() < protection_percentage else aligned for raw, aligned in
             zip(raw_events, aligned_events)]
-
-
-# ==========================================
-# PIPELINE: MULTI-STEP ALIGNER
-# ==========================================
-
-def align_procedural_midi(raw_events: list, genre="Lo-Fi", ppq=480, show_step=True) -> list:
-    profile = GENRE_PROFILES[genre]
-    log_step(f"Starting Alignment Profile: {genre}", show_step)
-
-    # 1. Entropy Sanity Check
-    pitches = [e['pitch'] for e in raw_events]
-    entropy = shannon_interval_entropy(pitches)
-    log_step(f"Calculated Shannon Entropy: {entropy:.2f} bits", show_step)
-
-    events_to_process = raw_events
-    if entropy > 3.0:
-        log_step("Entropy > 3.0 (Too chaotic). Applying Oblique Strategy: Retrograde.", show_step)
-        events_to_process = apply_oblique_strategies(raw_events, "retrograde")
-
-    # 2. Key Inference
-    pitch_durs = [(e['pitch'], e['duration']) for e in events_to_process]
-    implied_key = infer_key_ks(pitch_durs)
-    log_step(f"Inferred Musical Key: Root {implied_key[0]}, Scale {implied_key[1]}", show_step)
-
-    aligned_events = []
-
-    # 3-5. Processing Event loop
-    for i, event in enumerate(events_to_process):
-        aligned = event.copy()
-        step_16th = ppq / 4.0
-        step_index = int(aligned['time'] / step_16th)
-
-        # Rhythmic Quantize & Microtiming
-        if profile["quantize_strictness"] > 0:
-            aligned['time'] = quantize_and_swing(aligned['time'], ppq, profile['swing_percent'])
-            if genre == "Lo-Fi":
-                aligned['time'] = apply_dilla_microtiming(aligned.get('instrument', 'hihat'), step_index / 4.0,
-                                                          aligned['time'])
-
-        # Pitch / Scale constraints
-        if np.random.random() < profile["scale_strictness"]:
-            aligned['pitch'] = snap_to_scale(aligned['pitch'], implied_key[0], implied_key[1])
-
-        # Velocity and Tension Dynamics
-        vel, dur = apply_velocity_and_articulation(step_index, aligned['duration'])
-        bar_idx = aligned['time'] / (ppq * 4)
-        tension_mod = sigmoid_tension_multiplier(bar_idx, total_bars=16)
-        aligned['velocity'] = int(np.clip(vel * tension_mod, 1, 127))
-        aligned['duration'] = max(10, dur)  # prevent negative/zero duration
-
-        aligned_events.append(aligned)
-
-    # Apply Voice Leading / Chord fixes iteratively
-    log_step(f"Applying Low Interval Limits and Taxicab Voice Leading", show_step)
-    # (Simplified application: enforcing limits on raw pitch streams)
-    for i in range(len(aligned_events) - 1):
-        aligned_events[i + 1]['pitch'] = leap_resolution(aligned_events[i]['pitch'], aligned_events[i + 1]['pitch'],
-                                                         aligned_events[i + 1]['pitch'])
-        if aligned_events[i]['pitch'] < 48:  # Bass check
-            pair = enforce_low_interval_limits([aligned_events[i]['pitch'], aligned_events[i + 1]['pitch']])
-            aligned_events[i]['pitch'] = pair[0]
-
-    # Calculate global roughness for the log
-    final_roughness = calculate_chord_roughness([e['pitch'] for e in aligned_events[:6]])
-    log_step(f"Initial snippet roughness evaluated to: {final_roughness:.2f}", show_step)
-
-    # 6. Weirdness Preservation
-    weirdness_ratio = 1.0 - profile["scale_strictness"]
-    log_step(f"Protecting {weirdness_ratio * 100:.1f}% of original events (Weirdness filter).", show_step)
-    final_events = protect_weirdness(events_to_process, aligned_events, protection_percentage=weirdness_ratio)
-
-    log_step(f"Alignment Complete. Returned {len(final_events)} events.", show_step)
-    return final_events
 
 
 # ==========================================
@@ -518,7 +576,10 @@ def write_events_to_midi(events, meta_events, ppq, output_path):
     out_mid.save(output_path)
 
 
-def process_midi_file(input_file: str, genre: str = "Lo-Fi", show_step: bool = True):
+def process_midi_file(input_file: str,
+                      genre: str = "Lo-Fi",
+                      iterations: int = 3,
+                      show_step: bool = True):
     setup_logging()
 
     log_step(f"Opening input file: {input_file}", show_step)
@@ -526,8 +587,10 @@ def process_midi_file(input_file: str, genre: str = "Lo-Fi", show_step: bool = T
         log_step(f"Error: {input_file} not found.", show_step)
         return
 
-    base_name = os.path.splitext(input_file)[0]
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    os.makedirs("Restructured", exist_ok=True)
     output_file = f"Restructured/{base_name}_restructured.mid"
+    graph_file = f"Restructured/{base_name}_trajectory.png"
 
     # 1. Parse Input
     raw_events, meta_events, ppq, original_mid = read_midi_to_events(input_file)
@@ -537,13 +600,36 @@ def process_midi_file(input_file: str, genre: str = "Lo-Fi", show_step: bool = T
         log_step("No notes found in MIDI file.", show_step)
         return
 
-    # 2. Execute Align Engine
-    aligned_events = align_procedural_midi(raw_events, genre=genre, ppq=ppq, show_step=show_step)
+    # 2. Execute Align Engine iteratively (with convergence)
+    history = [raw_events]
+    current_events = raw_events
+    global_key = None
 
-    # 3. Export Output
-    write_events_to_midi(aligned_events, meta_events, ppq, output_file)
+    log_step(f"Running Alignment Engine for {iterations} iteration(s)...", show_step)
+    for i in range(iterations):
+        log_step(f"\n--- ITERATION {i+1}/{iterations} ---", show_step)
+        current_events, global_key = align_procedural_midi(
+            current_events,
+            genre=genre,
+            ppq=ppq,
+            iteration_depth=i,
+            global_key=global_key,
+            show_step=show_step
+        )
+        history.append([e.copy() for e in current_events])
+
+    # 3. (Optional) plot note trajectories if you kept plot_note_changes
+    try:
+        plot_note_changes(history, graph_file)
+        log_step(f"Saved pitch trajectory graph to: {graph_file}", show_step)
+    except NameError:
+        pass
+
+    # 4. Export Output
+    write_events_to_midi(current_events, meta_events, ppq, output_file)
     log_step(f"Successfully saved output to: {output_file}", show_step)
     log_step(f"Log written to: {log_file_path}", show_step)
+
 
 
 def write_events_to_midi(events, meta_events, ppq, output_path):
@@ -678,14 +764,26 @@ def process_midi_file(input_file: str, genre: str = "Lo-Fi", iterations: int = 1
         return
 
     # 2. Execute Align Engine Iteratively
-    history = [raw_events]  # Store iteration 0 (the raw noise)
+    history = [raw_events]
     current_events = raw_events
+    global_key = None
 
     log_step(f"Running Alignment Engine for {iterations} iteration(s)...", show_step)
     for i in range(iterations):
         log_step(f"\n--- ITERATION {i + 1}/{iterations} ---", show_step)
-        current_events = align_procedural_midi(current_events, genre=genre, ppq=ppq, show_step=show_step)
-        history.append(current_events)
+
+        # Pass the iteration depth and the locked key
+        current_events, global_key = align_procedural_midi(
+            current_events,
+            genre=genre,
+            ppq=ppq,
+            iteration_depth=i,
+            global_key=global_key,
+            show_step=show_step
+        )
+
+        # Deep copy to ensure Matplotlib history graph tracks correctly
+        history.append([e.copy() for e in current_events])
 
     # 3. Graph the Changes
     log_step(f"\nGenerating Pitch Trajectory Graph...", show_step)
