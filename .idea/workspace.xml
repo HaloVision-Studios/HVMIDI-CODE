@@ -4,9 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="fb323328-778f-44f6-959b-94dfadf98a95" name="Changes" comment="Made adjustments global, not local">
-      <change afterPath="$PROJECT_DIR$/GUI/aligner_read.md" afterDir="false" />
+    <list default="true" id="fb323328-778f-44f6-959b-94dfadf98a95" name="Changes" comment="Added in an extra thing I will need soon">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/GUI/aligner.py" beforeDir="false" afterPath="$PROJECT_DIR$/GUI/aligner.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -97,12 +97,21 @@
       <option name="project" value="LOCAL" />
       <updated>1773761545545</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="Added in an extra thing I will need soon">
+      <option name="closed" value="true" />
+      <created>1773818845274</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1773818845274</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="Addition of aligner v1 - only local alignment in the code. Issue: Still feels like noise." />
     <MESSAGE value="Made adjustments global, not local" />
-    <option name="LAST_COMMIT_MESSAGE" value="Made adjustments global, not local" />
+    <MESSAGE value="Added in an extra thing I will need soon" />
+    <option name="LAST_COMMIT_MESSAGE" value="Added in an extra thing I will need soon" />
   </component>
 </project>

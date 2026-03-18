@@ -318,10 +318,9 @@ def bass_identification_node(tracks: list) -> int:
     return bass_idx
 
 
-def extract_voices(events):
+def extract_and_align_voices(events, is_converging=False, max_polyphony=4):
     """
-    Separates a flat list of note events into Melodic (Skyline), Bass, and Inner voices
-    based on their temporal overlap and pitch ranges.
+    LEVEL 3 & 4: Separates voices, enforces max polyphony, and aligns vertical harmony.
     """
     # Group events by their quantized start times to find simultaneous chords/clusters
     time_clusters = {}
@@ -330,23 +329,59 @@ def extract_voices(events):
         if t not in time_clusters: time_clusters[t] = []
         time_clusters[t].append(e)
 
-    melody_events = []
-    bass_events = []
-    inner_events = []
+    melody_events, bass_events, inner_events = [], [], []
 
     for t, cluster in time_clusters.items():
         if not cluster: continue
         cluster.sort(key=lambda x: x['pitch'])
 
-        # Bass Node: Lowest note
-        bass_events.append(cluster[0])
+        # ==========================================
+        # LEVEL 3: DENSITY & POLYPHONY PRUNING
+        # ==========================================
+        if len(cluster) > max_polyphony:
+            bass = cluster[0]
+            melody = cluster[-1]
+            # Keep evenly spaced inner voices, drop the rest
+            allowed_inner = max_polyphony - 2
+            inner = cluster[1: 1 + allowed_inner]
+            pruned_cluster = [bass] + inner + [melody]
+        else:
+            pruned_cluster = cluster
 
-        if len(cluster) > 1:
-            # Skyline Node: Highest note
-            melody_events.append(cluster[-1])
+        # ==========================================
+        # LEVEL 4: HARMONY ALIGNMENT & BASS FORCING
+        # ==========================================
+        if is_converging and len(pruned_cluster) >= 3:
+            pitches = [e['pitch'] for e in pruned_cluster]
+            chord_info = infer_chord(pitches)
 
-            # Inner Voices: Everything in between
-            for inner in cluster[1:-1]:
+            if chord_info:
+                root_pc, chord_name = chord_info
+
+                # 1. Force Bass to Chord Root
+                bass_event = pruned_cluster[0]
+                bass_octave = (bass_event['pitch'] // 12) * 12
+                bass_event['pitch'] = bass_octave + root_pc
+
+                # 2. Snap Inner Voices strictly to the chord template
+                template = CHORD_TEMPLATES[chord_name]
+                allowed_pcs = [(root_pc + i) % 12 for i in template]
+
+                for note in pruned_cluster[1:-1]:
+                    pc = note['pitch'] % 12
+                    if pc not in allowed_pcs:
+                        # Find nearest chord tone
+                        best_shift, min_dist = 0, 100
+                        for offset in range(-6, 7):
+                            if (pc + offset) % 12 in allowed_pcs and abs(offset) < min_dist:
+                                min_dist, best_shift = abs(offset), offset
+                        note['pitch'] += best_shift
+
+        # Append to respective streams
+        bass_events.append(pruned_cluster[0])
+        if len(pruned_cluster) > 1:
+            melody_events.append(pruned_cluster[-1])
+            for inner in pruned_cluster[1:-1]:
                 inner_events.append(inner)
 
     return bass_events, inner_events, melody_events
@@ -384,8 +419,18 @@ def align_procedural_midi(raw_events: list,
     aligned_events = []
     aligned_events_per_stream = {"bass": [], "inner": [], "melody": []}
 
-    # 2. Extract stable voices for deterministic passing
-    bass_stream, inner_stream, melody_stream = extract_voices(raw_events)
+    # Set Polyphony based on Genre (fallback to 4 if not defined)
+    max_polyphony = profile.get("max_polyphony", 4)
+    if genre in ["Jazz", "Ambient"]: max_polyphony = 6
+    if genre in ["Trap", "EDM"]: max_polyphony = 3
+
+    # 2. Extract stable voices, prune density, and force chords
+    bass_stream, inner_stream, melody_stream = extract_and_align_voices(
+        raw_events,
+        is_converging=is_converging,
+        max_polyphony=max_polyphony
+    )
+
     all_streams = [("bass", bass_stream), ("inner", inner_stream), ("melody", melody_stream)]
 
     for stream_name, stream in all_streams:
