@@ -7,6 +7,7 @@ import itertools
 from collections import Counter
 from datetime import datetime
 import mido
+import random
 
 try:
     import matplotlib.pyplot as plt
@@ -318,11 +319,12 @@ def bass_identification_node(tracks: list) -> int:
     return bass_idx
 
 
-def extract_and_align_voices(events, is_converging=False, max_polyphony=4):
+def extract_and_align_voices(events, is_converging=False, max_polyphony=4, genre="Ambient"):
     """
-    LEVEL 3 & 4: Separates voices, enforces max polyphony, and aligns vertical harmony.
+    LEVEL 3: Separates voices and enforces max polyphony.
+    LEVEL 4: Aligns vertical harmony AND horizontal voice-leading (inversions & smooth transitions).
     """
-    # Group events by their quantized start times to find simultaneous chords/clusters
+    # Group events by their quantized start times
     time_clusters = {}
     for e in events:
         t = round(e['time'] / 120) * 120  # Group by 16th note grid approx
@@ -331,7 +333,15 @@ def extract_and_align_voices(events, is_converging=False, max_polyphony=4):
 
     melody_events, bass_events, inner_events = [], [], []
 
-    for t, cluster in time_clusters.items():
+    # LEVEL 4 MEMORY STATE: Track previous pitches for smooth horizontal voice-leading
+    prev_bass_pitch = None
+    prev_inner_pitches = []
+
+    # Process clusters chronologically!
+    sorted_times = sorted(time_clusters.keys())
+
+    for t in sorted_times:
+        cluster = time_clusters[t]
         if not cluster: continue
         cluster.sort(key=lambda x: x['pitch'])
 
@@ -341,7 +351,6 @@ def extract_and_align_voices(events, is_converging=False, max_polyphony=4):
         if len(cluster) > max_polyphony:
             bass = cluster[0]
             melody = cluster[-1]
-            # Keep evenly spaced inner voices, drop the rest
             allowed_inner = max_polyphony - 2
             inner = cluster[1: 1 + allowed_inner]
             pruned_cluster = [bass] + inner + [melody]
@@ -349,7 +358,7 @@ def extract_and_align_voices(events, is_converging=False, max_polyphony=4):
             pruned_cluster = cluster
 
         # ==========================================
-        # LEVEL 4: HARMONY ALIGNMENT & BASS FORCING
+        # LEVEL 4: HARMONY ALIGNMENT & VOICE LEADING
         # ==========================================
         if is_converging and len(pruned_cluster) >= 3:
             pitches = [e['pitch'] for e in pruned_cluster]
@@ -357,25 +366,66 @@ def extract_and_align_voices(events, is_converging=False, max_polyphony=4):
 
             if chord_info:
                 root_pc, chord_name = chord_info
-
-                # 1. Force Bass to Chord Root
-                bass_event = pruned_cluster[0]
-                bass_octave = (bass_event['pitch'] // 12) * 12
-                bass_event['pitch'] = bass_octave + root_pc
-
-                # 2. Snap Inner Voices strictly to the chord template
                 template = CHORD_TEMPLATES[chord_name]
                 allowed_pcs = [(root_pc + i) % 12 for i in template]
 
-                for note in pruned_cluster[1:-1]:
-                    pc = note['pitch'] % 12
-                    if pc not in allowed_pcs:
-                        # Find nearest chord tone
-                        best_shift, min_dist = 0, 100
-                        for offset in range(-6, 7):
-                            if (pc + offset) % 12 in allowed_pcs and abs(offset) < min_dist:
-                                min_dist, best_shift = abs(offset), offset
-                        note['pitch'] += best_shift
+                # --- 1. Bass Alignment (Roots vs. Inversions) ---
+                bass_event = pruned_cluster[0]
+                bass_octave = (bass_event['pitch'] // 12) * 12
+
+                # Allow inversions for smoother basslines in organic genres
+                if genre in ["Jazz", "Classical", "Ambient"] and prev_bass_pitch is not None:
+                    best_bass_pc = root_pc
+                    min_dist = 100
+                    # Find the chord tone that requires the smallest leap from the previous bass note
+                    for pc in allowed_pcs:
+                        cand_pitch = bass_octave + pc
+                        dist = abs(cand_pitch - prev_bass_pitch)
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_bass_pc = pc
+                    bass_event['pitch'] = bass_octave + best_bass_pc
+                else:
+                    # EDM/Trap/Pop strictness: Always force the Root note
+                    bass_event['pitch'] = bass_octave + root_pc
+
+                prev_bass_pitch = bass_event['pitch']
+
+                # --- 2. Inner Voices Horizontal Voice-Leading ---
+                inner_notes = pruned_cluster[1:-1]
+
+                if prev_inner_pitches and len(inner_notes) == len(prev_inner_pitches):
+                    # We have a stable number of voices. Match each voice to the nearest
+                    # valid chord tone relative to its PREVIOUS pitch to minimize leaps.
+                    for i, note in enumerate(inner_notes):
+                        prev_pitch = prev_inner_pitches[i]
+                        search_octave = (prev_pitch // 12) * 12
+
+                        best_pitch = note['pitch']
+                        min_leap = 100
+
+                        # Check allowed pitch classes in the previous octave and adjacent octaves
+                        for pc in allowed_pcs:
+                            for oct_offset in [-12, 0, 12]:
+                                cand_pitch = search_octave + oct_offset + pc
+                                leap = abs(cand_pitch - prev_pitch)
+                                if leap < min_leap:
+                                    min_leap = leap
+                                    best_pitch = cand_pitch
+                        note['pitch'] = best_pitch
+                else:
+                    # Fallback: strict vertical snapping if voice count changes
+                    for note in inner_notes:
+                        pc = note['pitch'] % 12
+                        if pc not in allowed_pcs:
+                            best_shift, min_dist = 0, 100
+                            for offset in range(-6, 7):
+                                if (pc + offset) % 12 in allowed_pcs and abs(offset) < min_dist:
+                                    min_dist, best_shift = abs(offset), offset
+                            note['pitch'] += best_shift
+
+                # Update memory for the next chord
+                prev_inner_pitches = [n['pitch'] for n in inner_notes]
 
         # Append to respective streams
         bass_events.append(pruned_cluster[0])
@@ -386,6 +436,194 @@ def extract_and_align_voices(events, is_converging=False, max_polyphony=4):
 
     return bass_events, inner_events, melody_events
 
+
+def apply_motif_repetition(melody_events, bar_length=1920, motif_bars=2, copy_to_bar=4):
+    """
+    LEVEL 6: Extracts a melodic motif from the start of the piece and repeats it later
+    to create a recognizable human structure (e.g., A-B-A-C form).
+    Assuming 480 PPQ, a 4/4 bar is 1920 ticks.
+    """
+    if not melody_events:
+        return melody_events
+
+    # 1. Extract the motif (e.g., the notes in Bar 0 and Bar 1)
+    motif_events = []
+    for e in melody_events:
+        if e['time'] < (bar_length * motif_bars):
+            motif_events.append(e)
+
+    # 2. Clear out the destination bars to avoid overlapping mud
+    target_start = copy_to_bar * bar_length
+    target_end = target_start + (motif_bars * bar_length)
+
+    new_melody = [e for e in melody_events if not (target_start <= e['time'] < target_end)]
+
+    # 3. Paste the motif into the destination bars
+    for e in motif_events:
+        new_e = dict(e)  # Duplicate the event dictionary
+        new_e['time'] += target_start
+        new_melody.append(new_e)
+
+    # Sort chronologically
+    return sorted(new_melody, key=lambda x: x['time'])
+
+
+def apply_phrase_boundaries(all_events, bar_length=1920, phrase_bars=4, rest_ticks=480):
+    """
+    LEVEL 6: Forces a "breath" or rest at the end of every phrase (e.g., every 4 bars).
+    Cuts notes short and prevents notes from playing in the rest zone.
+    rest_ticks=480 equals a 1-beat rest at 480 PPQ.
+    """
+    phrase_length = bar_length * phrase_bars
+    structured_events = []
+
+    for e in all_events:
+        # Determine which phrase this note falls into
+        phrase_index = int(e['time'] // phrase_length)
+        phrase_end_time = (phrase_index + 1) * phrase_length
+
+        # 1. If a note starts right inside the "breath/rest" zone, delete it (skip)
+        if e['time'] >= phrase_end_time - rest_ticks:
+            continue
+
+        # 2. If a note extends into the "breath" zone, truncate its duration
+        e_copy = dict(e)
+        note_end = e_copy['time'] + e_copy.get('duration', 120)
+
+        if note_end > phrase_end_time - rest_ticks:
+            e_copy['duration'] = max(30, (phrase_end_time - rest_ticks) - e_copy['time'])
+
+        structured_events.append(e_copy)
+
+    return structured_events
+
+def smooth_harmonic_rhythm(bass_events, inner_events, melody_events, bar_length=1920, chords_per_bar=1):
+    """
+    LEVEL 6: Enforces a steady Harmonic Rhythm.
+    Instead of changing chords randomly on every 16th note, this identifies
+    the dominant chord in each measure and forces all inner voices to stick to it.
+    """
+    all_events = bass_events + inner_events + melody_events
+    if not all_events: return bass_events, inner_events
+
+    max_time = max(e['time'] for e in all_events)
+    total_bars = int((max_time // bar_length) + 1)
+
+    smoothed_inner = []
+    smoothed_bass = []
+
+    for bar_idx in range(total_bars):
+        bar_start = bar_idx * bar_length
+        bar_end = bar_start + bar_length
+
+        # Grab all notes in this bar
+        bar_notes = [e for e in all_events if bar_start <= e['time'] < bar_end]
+        if not bar_notes: continue
+
+        # 1. Infer the dominant chord for the ENTIRE bar
+        pitches = [e['pitch'] for e in bar_notes]
+        chord_info = infer_chord(pitches)
+
+        if chord_info:
+            root_pc, chord_name = chord_info
+            template = CHORD_TEMPLATES[chord_name]
+            allowed_pcs = [(root_pc + i) % 12 for i in template]
+
+            # 2. Force Bar Bass Note
+            bar_bass = [e for e in bass_events if bar_start <= e['time'] < bar_end]
+            for be in bar_bass:
+                bass_octave = (be['pitch'] // 12) * 12
+                # Ensure the bass hits the root of the bar's macro-chord on strong beats
+                if be['time'] % (bar_length // chords_per_bar) == 0:
+                    be['pitch'] = bass_octave + root_pc
+                smoothed_bass.append(be)
+
+            # 3. Force Inner Voices to stay within the Bar's macro-chord
+            bar_inner = [e for e in inner_events if bar_start <= e['time'] < bar_end]
+            for ie in bar_inner:
+                pc = ie['pitch'] % 12
+                if pc not in allowed_pcs:
+                    # Shift to nearest chord tone
+                    best_shift, min_dist = 0, 100
+                    for offset in range(-6, 7):
+                        if (pc + offset) % 12 in allowed_pcs and abs(offset) < min_dist:
+                            min_dist, best_shift = abs(offset), offset
+                    ie['pitch'] += best_shift
+                smoothed_inner.append(ie)
+        else:
+            # Fallback if no chord inferred
+            smoothed_bass.extend([e for e in bass_events if bar_start <= e['time'] < bar_end])
+            smoothed_inner.extend([e for e in inner_events if bar_start <= e['time'] < bar_end])
+
+    return sorted(smoothed_bass, key=lambda x: x['time']), sorted(smoothed_inner, key=lambda x: x['time'])
+
+
+def apply_phrase_grammar(melody_events, bar_length=1920, structure="AABA"):
+    """
+    LEVEL 6: Extracts a 2-bar motif (A) and applies it to a formal song structure.
+    Implements 'Repetition vs Surprise' by mutating the return phrases.
+    """
+    if not melody_events: return melody_events
+
+    phrase_length = bar_length * 2  # Each letter in AABA is 2 bars
+    motif_A = [e for e in melody_events if e['time'] < phrase_length]
+
+    if not motif_A: return melody_events
+
+    new_melody = []
+
+    for i, part in enumerate(structure):
+        target_start = i * phrase_length
+
+        if part == 'A':
+            # Literal repetition
+            for e in motif_A:
+                new_e = dict(e)
+                new_e['time'] += target_start
+                new_melody.append(new_e)
+
+        elif part == 'A*':
+            # Variation: Same rhythm, transposed slightly for the ending
+            for e in motif_A:
+                new_e = dict(e)
+                new_e['time'] += target_start
+                # Change the pitch of the last few notes to create a turnaround
+                if new_e['time'] > target_start + (phrase_length * 0.75):
+                    new_e['pitch'] += random.choice([-2, 2, -4])  # Diatonic-ish drift
+                new_melody.append(new_e)
+
+        elif part == 'B':
+            # Contrast: Let the original noise pass through un-copied
+            target_end = target_start + phrase_length
+            b_section = [e for e in melody_events if target_start <= e['time'] < target_end]
+            new_melody.extend(b_section)
+
+    return sorted(new_melody, key=lambda x: x['time'])
+
+
+def apply_phrase_boundaries(all_events, bar_length=1920, phrase_bars=4, rest_ticks=480):
+    """
+    LEVEL 6: Forces a 'breath' or rest at the end of every phrase.
+    """
+    phrase_length = bar_length * phrase_bars
+    structured_events = []
+
+    for e in all_events:
+        phrase_index = int(e['time'] // phrase_length)
+        phrase_end_time = (phrase_index + 1) * phrase_length
+
+        if e['time'] >= phrase_end_time - rest_ticks:
+            continue
+
+        e_copy = dict(e)
+        note_end = e_copy['time'] + e_copy.get('duration', 120)
+
+        if note_end > phrase_end_time - rest_ticks:
+            e_copy['duration'] = max(30, (phrase_end_time - rest_ticks) - e_copy['time'])
+
+        structured_events.append(e_copy)
+
+    return structured_events
 
 def align_procedural_midi(raw_events: list,
                           genre: str = "Lo-Fi",
@@ -424,13 +662,41 @@ def align_procedural_midi(raw_events: list,
     if genre in ["Jazz", "Ambient"]: max_polyphony = 6
     if genre in ["Trap", "EDM"]: max_polyphony = 3
 
-    # 2. Extract stable voices, prune density, and force chords
+    # 2. Extract stable voices, prune density, and force chords/voice-leading (Levels 3 & 4)
     bass_stream, inner_stream, melody_stream = extract_and_align_voices(
         raw_events,
         is_converging=is_converging,
-        max_polyphony=max_polyphony
+        max_polyphony=max_polyphony,
+        genre=genre
     )
 
+    # ==========================================
+    # LEVEL 6: STRUCTURE & ARRANGEMENT SMOOTHING
+    # ==========================================
+    if is_converging:
+        # A. Harmonic Rhythm Smoothing (1 chord per bar)
+        chords_per_bar = 2 if genre in ["Jazz", "Classical"] else 1
+        bass_stream, inner_stream = smooth_harmonic_rhythm(
+            bass_stream, inner_stream, melody_stream,
+            bar_length=1920, chords_per_bar=chords_per_bar
+        )
+
+        # B. Formal Grammar / Motif Variation (A-A*-B-A structure)
+        # Using A* for the second pass to create a changed ending (repetition vs surprise)
+        melody_stream = apply_phrase_grammar(melody_stream, bar_length=1920, structure="AA*BA")
+
+        # C. Phrase Boundaries (The "Breath")
+        combined_temp = bass_stream + inner_stream + melody_stream
+        # Make the rest longer for EDM/Trap (drops), shorter for Ambient
+        rest_amount = 960 if genre in ["EDM", "Trap"] else 240
+        combined_temp = apply_phrase_boundaries(combined_temp, bar_length=1920, phrase_bars=4, rest_ticks=rest_amount)
+
+        # Re-separate for Level 5
+        bass_stream = [e for e in combined_temp if e in bass_stream]
+        inner_stream = [e for e in combined_temp if e in inner_stream]
+        melody_stream = [e for e in combined_temp if e in melody_stream]
+
+    # 3. Prepare streams for Level 5 Microtiming
     all_streams = [("bass", bass_stream), ("inner", inner_stream), ("melody", melody_stream)]
 
     for stream_name, stream in all_streams:
